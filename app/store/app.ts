@@ -14,7 +14,19 @@ import Locale from "../locales";
 export type Message = ChatCompletionResponseMessage & {
   date: string;
   streaming?: boolean;
+  isError?: boolean;
+  id?: number;
 };
+
+export function createMessage(override: Partial<Message>): Message {
+  return {
+    id: Date.now(),
+    date: new Date().toLocaleString(),
+    role: "user",
+    content: "",
+    ...override,
+  };
+}
 
 export enum SubmitKey {
   Enter = "Enter",
@@ -84,43 +96,39 @@ export const ALL_MODELS = [
   },
 ];
 
-export function isValidModel(name: string) {
-  return ALL_MODELS.some((m) => m.name === name && m.available);
+export function limitNumber(
+  x: number,
+  min: number,
+  max: number,
+  defaultValue: number,
+) {
+  if (typeof x !== "number" || isNaN(x)) {
+    return defaultValue;
+  }
+
+  return Math.min(max, Math.max(min, x));
 }
 
-export function isValidNumber(x: number, min: number, max: number) {
-  return typeof x === "number" && x <= max && x >= min;
+export function limitModel(name: string) {
+  return ALL_MODELS.some((m) => m.name === name && m.available)
+    ? name
+    : ALL_MODELS[4].name;
 }
 
-export function filterConfig(oldConfig: ModelConfig): Partial<ModelConfig> {
-  const config = Object.assign({}, oldConfig);
-
-  const validator: {
-    [k in keyof ModelConfig]: (x: ModelConfig[keyof ModelConfig]) => boolean;
-  } = {
-    model(x) {
-      return isValidModel(x as string);
-    },
-    max_tokens(x) {
-      return isValidNumber(x as number, 100, 4000);
-    },
-    presence_penalty(x) {
-      return isValidNumber(x as number, -2, 2);
-    },
-    temperature(x) {
-      return isValidNumber(x as number, 0, 2);
-    },
-  };
-
-  Object.keys(validator).forEach((k) => {
-    const key = k as keyof ModelConfig;
-    if (!validator[key](config[key])) {
-      delete config[key];
-    }
-  });
-
-  return config;
-}
+export const ModalConfigValidator = {
+  model(x: string) {
+    return limitModel(x);
+  },
+  max_tokens(x: number) {
+    return limitNumber(x, 0, 32000, 2000);
+  },
+  presence_penalty(x: number) {
+    return limitNumber(x, -2, 2, 0);
+  },
+  temperature(x: number) {
+    return limitNumber(x, 0, 2, 1);
+  },
+};
 
 const DEFAULT_CONFIG: ChatConfig = {
   historyMessageCount: 4,
@@ -152,6 +160,7 @@ export interface ChatStat {
 export interface ChatSession {
   id: number;
   topic: string;
+  sendMemory: boolean;
   memoryPrompt: string;
   context: Message[];
   messages: Message[];
@@ -161,11 +170,10 @@ export interface ChatSession {
 }
 
 const DEFAULT_TOPIC = Locale.Store.DefaultTopic;
-export const BOT_HELLO: Message = {
+export const BOT_HELLO: Message = createMessage({
   role: "assistant",
   content: Locale.Store.BotHello,
-  date: "",
-};
+});
 
 function createEmptySession(): ChatSession {
   const createDate = new Date().toLocaleString();
@@ -173,6 +181,7 @@ function createEmptySession(): ChatSession {
   return {
     id: Date.now(),
     topic: DEFAULT_TOPIC,
+    sendMemory: true,
     memoryPrompt: "",
     context: [],
     messages: [],
@@ -192,6 +201,7 @@ interface ChatStore {
   currentSessionIndex: number;
   clearSessions: () => void;
   removeSession: (index: number) => void;
+  moveSession: (from: number, to: number) => void;
   selectSession: (index: number) => void;
   newSession: () => void;
   currentSession: () => ChatSession;
@@ -205,6 +215,7 @@ interface ChatStore {
     messageIndex: number,
     updater: (message?: Message) => void,
   ) => void;
+  resetSession: () => void;
   getMessagesWithMemory: () => Message[];
   getMemoryPrompt: () => Message;
 
@@ -281,6 +292,31 @@ export const useChatStore = create<ChatStore>()(
         });
       },
 
+      moveSession(from: number, to: number) {
+        set((state) => {
+          const { sessions, currentSessionIndex: oldIndex } = state;
+
+          // move the session
+          const newSessions = [...sessions];
+          const session = newSessions[from];
+          newSessions.splice(from, 1);
+          newSessions.splice(to, 0, session);
+
+          // modify current session id
+          let newIndex = oldIndex === from ? to : oldIndex;
+          if (oldIndex > from && oldIndex <= to) {
+            newIndex -= 1;
+          } else if (oldIndex < from && oldIndex >= to) {
+            newIndex += 1;
+          }
+
+          return {
+            currentSessionIndex: newIndex,
+            sessions: newSessions,
+          };
+        });
+      },
+
       newSession() {
         set((state) => ({
           currentSessionIndex: 0,
@@ -311,18 +347,15 @@ export const useChatStore = create<ChatStore>()(
       },
 
       async onUserInput(content) {
-        const userMessage: Message = {
+        const userMessage: Message = createMessage({
           role: "user",
           content,
-          date: new Date().toLocaleString(),
-        };
+        });
 
-        const botMessage: Message = {
-          content: "",
+        const botMessage: Message = createMessage({
           role: "assistant",
-          date: new Date().toLocaleString(),
           streaming: true,
-        };
+        });
 
         // get recent messages
         const recentMessages = get().getMessagesWithMemory();
@@ -345,23 +378,32 @@ export const useChatStore = create<ChatStore>()(
               botMessage.streaming = false;
               botMessage.content = content;
               get().onNewMessage(botMessage);
-              ControllerPool.remove(sessionIndex, messageIndex);
+              ControllerPool.remove(
+                sessionIndex,
+                botMessage.id ?? messageIndex,
+              );
             } else {
               botMessage.content = content;
               set(() => ({}));
             }
           },
-          onError(error) {
-            botMessage.content += "\n\n" + Locale.Store.Error;
+          onError(error, statusCode) {
+            if (statusCode === 401) {
+              botMessage.content = Locale.Error.Unauthorized;
+            } else {
+              botMessage.content += "\n\n" + Locale.Store.Error;
+            }
             botMessage.streaming = false;
+            userMessage.isError = true;
+            botMessage.isError = true;
             set(() => ({}));
-            ControllerPool.remove(sessionIndex, messageIndex);
+            ControllerPool.remove(sessionIndex, botMessage.id ?? messageIndex);
           },
           onController(controller) {
             // collect controller for stop/retry
             ControllerPool.addController(
               sessionIndex,
-              messageIndex,
+              botMessage.id ?? messageIndex,
               controller,
             );
           },
@@ -383,17 +425,22 @@ export const useChatStore = create<ChatStore>()(
       getMessagesWithMemory() {
         const session = get().currentSession();
         const config = get().config;
-        const n = session.messages.length;
+        const messages = session.messages.filter((msg) => !msg.isError);
+        const n = messages.length;
 
         const context = session.context.slice();
 
-        if (session.memoryPrompt && session.memoryPrompt.length > 0) {
+        if (
+          session.sendMemory &&
+          session.memoryPrompt &&
+          session.memoryPrompt.length > 0
+        ) {
           const memoryPrompt = get().getMemoryPrompt();
           context.push(memoryPrompt);
         }
 
         const recentMessages = context.concat(
-          session.messages.slice(Math.max(0, n - config.historyMessageCount)),
+          messages.slice(Math.max(0, n - config.historyMessageCount)),
         );
 
         return recentMessages;
@@ -411,6 +458,13 @@ export const useChatStore = create<ChatStore>()(
         set(() => ({ sessions }));
       },
 
+      resetSession() {
+        get().updateCurrentSession((session) => {
+          session.messages = [];
+          session.memoryPrompt = "";
+        });
+      },
+
       summarizeSession() {
         const session = get().currentSession();
 
@@ -423,7 +477,8 @@ export const useChatStore = create<ChatStore>()(
           requestWithPrompt(session.messages, Locale.Store.Prompt.Topic).then(
             (res) => {
               get().updateCurrentSession(
-                (session) => (session.topic = trimTopic(res)),
+                (session) =>
+                  (session.topic = res ? trimTopic(res) : DEFAULT_TOPIC),
               );
             },
           );
@@ -502,12 +557,16 @@ export const useChatStore = create<ChatStore>()(
     }),
     {
       name: LOCAL_KEY,
-      version: 1.1,
+      version: 1.2,
       migrate(persistedState, version) {
         const state = persistedState as ChatStore;
 
         if (version === 1) {
           state.sessions.forEach((s) => (s.context = []));
+        }
+
+        if (version < 1.2) {
+          state.sessions.forEach((s) => (s.sendMemory = true));
         }
 
         return state;
